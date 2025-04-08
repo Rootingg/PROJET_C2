@@ -1,6 +1,6 @@
 CC = cc
 CFLAGS = -Wall -O2
-LDFLAGS = -lcurl -ljson-c
+LDFLAGS = -lcurl -ljson-c -pthread
 TARGET = main
 
 all: $(TARGET)

